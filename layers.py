@@ -103,7 +103,7 @@ LAYER_GROUPS: dict[str, LayerGroup] = {
     ),
     "bag_pand": LayerGroup(
         id="bag_pand", label="BAG panden", default_on=True,
-        collections=(Collection("bag", "pand", "polygon", "BAG_Pand", ACI_RED),),
+        collections=(Collection("bag", "pand", "polygon", "BAG_Pand", 30),),   # oranje: los te zien van BGT_Pand (rood)
     ),
     "bag_adres": LayerGroup(
         id="bag_adres", label="BAG adressen", default_on=False,

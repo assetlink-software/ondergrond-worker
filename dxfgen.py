@@ -58,7 +58,7 @@ class Options:
     include_frame: bool = True
     clip_mode: str = "hard"          # "hard" | "whole"
     hatch: bool = True
-    author: str = "Ondergrond NL · AssetLink"
+    author: str = "AssetLink · assetlink-ondergrond.com"
 
 
 @dataclass
