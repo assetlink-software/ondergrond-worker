@@ -1,0 +1,9 @@
+{
+  "name": "ondergrond-dwg",
+  "private": true,
+  "type": "module",
+  "description": "DXF -> DWG (AutoCAD 2018) converter for the Ondergrond NL worker, based on acad-ts (MIT, port of ACadSharp)",
+  "dependencies": {
+    "@node-projects/acad-ts": "3.6.0"
+  }
+}

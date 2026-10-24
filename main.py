@@ -5,11 +5,13 @@ POST /generate
     "adres": "Stadhuisplein 2, Lelystad"      (or "x": 161234.5, "y": 500118.1)
     "straal_m": 100                            (or "polygon": [[x,y], ...])
     "lagen": ["bgt_basis", "bag_pand", "brk_perceel"],
+    "formaat": "dxf"                           (or "dwg" — AutoCAD 2018)
     "opties": {"text_height": 1.0, "include_frame": true, "clip_mode": "hard", "hatch": true}
   }
   → { "job_id", "url", "bestand", "objecten", "lagen": {...}, "waarschuwingen": [...], "duur_ms" }
 
-GET /dxf/{name}?q=<token>    → the DXF, rebuilt on request (stateless, works on any instance)
+GET /dxf/{name}?q=<token>    → the file, rebuilt on request (stateless, works on any instance)
+GET /dwg/{name}?q=<token>    → same, as DWG (the token says which format)
 GET /geocode?q=...           → Locatieserver proxy
 GET /health
 """
@@ -21,8 +23,11 @@ import base64
 import io
 import json
 import zlib
+from collections import OrderedDict
 import logging
 import os
+import shutil
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -44,6 +49,11 @@ FILE_TTL_HOURS = float(os.environ.get("FILE_TTL_HOURS", "24"))
 PUBLIC_BASE = os.environ.get("PUBLIC_BASE", "")          # e.g. https://worker.ondergrond.nl
 RATE_LIMIT_PER_HOUR = int(os.environ.get("RATE_LIMIT_PER_HOUR", "30"))
 MAX_RADIUS_M = float(os.environ.get("MAX_RADIUS_M", "2000"))
+NODE_BIN = os.environ.get("NODE_BIN", "node")
+DWG_SCRIPT = os.environ.get("DWG_SCRIPT", str(Path(__file__).parent / "dwg" / "dxf2dwg.mjs"))
+DWG_TIMEOUT_S = float(os.environ.get("DWG_TIMEOUT_S", "90"))
+DWG_MAX_DXF_MB = float(os.environ.get("DWG_MAX_DXF_MB", "25"))   # ~10 s and ~700 MB RAM for the converter
+CACHE_MAX_MB = float(os.environ.get("CACHE_MAX_MB", "120"))
 
 FILES_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -89,11 +99,13 @@ class GenerateRequest(BaseModel):
     polygon: list[list[float]] | None = None
     lagen: list[str] = Field(default_factory=default_group_ids)
     opties: Opties = Opties()
+    formaat: str = Field("dxf", pattern="^(dxf|dwg)$")
 
 
 @app.get("/health")
 async def health():
-    return {"ok": True, "lagen": list(LAYER_GROUPS)}
+    dwg = bool(shutil.which(NODE_BIN)) and Path(DWG_SCRIPT).exists()
+    return {"ok": True, "lagen": list(LAYER_GROUPS), "formaten": ["dxf", "dwg"] if dwg else ["dxf"]}
 
 
 @app.get("/lagen")
@@ -165,7 +177,7 @@ async def _build(req: GenerateRequest) -> _Built:
                   clip_mode=req.opties.clip_mode, hatch=req.opties.hatch)
     doc, result = await asyncio.to_thread(build_dxf, feats, area, opt, warnings)
     rad = f"{area.radius_m:g}m" if area.radius_m else "polygoon"
-    name = f"ondergrond_{int(cx)}_{int(cy)}_{rad}.dxf"
+    name = f"ondergrond_{int(cx)}_{int(cy)}_{rad}.{req.formaat}"
     return _Built(doc, result, area, cx, cy, naam, name)
 
 
@@ -173,6 +185,50 @@ def _dxf_bytes(doc) -> bytes:
     buf = io.StringIO()
     doc.write(buf)
     return buf.getvalue().encode("utf-8")
+
+
+async def _dwg_bytes(dxf: bytes, area) -> bytes:
+    """DXF → DWG (AutoCAD 2018) with acad-ts (MIT) in a Node subprocess."""
+    if not shutil.which(NODE_BIN) or not Path(DWG_SCRIPT).exists():
+        raise HTTPException(501, "DWG is op deze server niet beschikbaar. Kies DXF.")
+    if len(dxf) > DWG_MAX_DXF_MB * 1_000_000:
+        raise HTTPException(413, f"Dit gebied is te groot voor DWG ({len(dxf) / 1e6:.0f} MB). "
+                                 "Kies een kleiner gebied, of DXF: dat opent in elk CAD-pakket ook.")
+    minx, miny, maxx, maxy = area.bbox
+    pad = (maxx - minx) * 0.15                 # same margin as the DXF view, room for title block + north arrow
+    ext = [f"{v:.2f}" for v in (minx - pad, miny - pad, maxx + pad, maxy + pad)]
+    with tempfile.TemporaryDirectory(prefix="dwg-") as tmp:
+        src, dst = Path(tmp, "in.dxf"), Path(tmp, "out.dwg")
+        src.write_bytes(dxf)
+        proc = await asyncio.create_subprocess_exec(
+            NODE_BIN, DWG_SCRIPT, str(src), str(dst), *ext,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        try:
+            _, err = await asyncio.wait_for(proc.communicate(), DWG_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            proc.kill()
+            raise HTTPException(504, "Omzetten naar DWG duurde te lang. Kies een kleiner gebied of DXF.")
+        if proc.returncode != 0 or not dst.exists():
+            log.error("dxf2dwg failed (%s): %s", proc.returncode, err.decode(errors="replace")[-500:])
+            raise HTTPException(500, "Omzetten naar DWG is mislukt. DXF werkt wel; probeer dat formaat.")
+        return dst.read_bytes()
+
+
+async def _file_bytes(b: "_Built", formaat: str) -> bytes:
+    dxf = await asyncio.to_thread(_dxf_bytes, b.doc)
+    return await _dwg_bytes(dxf, b.area) if formaat == "dwg" else dxf
+
+
+# Small per-instance cache: the download right after /generate usually lands on the same
+# instance, so it is served without fetching PDOK and converting again. A miss just rebuilds.
+_cache: "OrderedDict[str, tuple[str, bytes]]" = OrderedDict()
+
+
+def _cache_put(token: str, name: str, data: bytes) -> None:
+    _cache[token] = (name, data)
+    _cache.move_to_end(token)
+    while _cache and sum(len(d) for _, d in _cache.values()) > CACHE_MAX_MB * 1_000_000:
+        _cache.popitem(last=False)
 
 
 def _encode_req(req: GenerateRequest, cx: float, cy: float) -> str:
@@ -183,6 +239,7 @@ def _encode_req(req: GenerateRequest, cx: float, cy: float) -> str:
         "p": [[round(a, 2), round(b, 2)] for a, b in req.polygon] if req.polygon else None,
         "l": req.lagen,
         "o": req.opties.model_dump(),
+        "f": req.formaat,
     }
     raw = zlib.compress(json.dumps(data, separators=(",", ":")).encode(), 9)
     return base64.urlsafe_b64encode(raw).decode().rstrip("=")
@@ -193,7 +250,8 @@ def _decode_req(token: str) -> GenerateRequest:
         raw = zlib.decompress(base64.urlsafe_b64decode(token + "=" * (-len(token) % 4)))
         d = json.loads(raw)
         return GenerateRequest(x=d["x"], y=d["y"], straal_m=d.get("r"), polygon=d.get("p"),
-                               lagen=d["l"], opties=Opties(**d.get("o", {})))
+                               lagen=d["l"], opties=Opties(**d.get("o", {})),
+                               formaat=d.get("f", "dxf"))
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(400, "Ongeldige downloadlink.") from exc
 
@@ -210,15 +268,18 @@ async def generate(req: GenerateRequest, request: Request):
     t0 = time.perf_counter()
     _check_rate(request.client.host if request.client else "?")
     b = await _build(req)
-    size = len(await asyncio.to_thread(_dxf_bytes, b.doc))
+    data = await _file_bytes(b, req.formaat)
+    size = len(data)
     duur = int((time.perf_counter() - t0) * 1000)
     token = _encode_req(req, b.cx, b.cy)
+    _cache_put(token, b.name, data)
     log.info("generate %s: %s objects, %d layers, %d bytes, %d ms", b.name, b.result.objects, len(b.result.counts), size, duur)
     return {
         "job_id": token[:12],
         # stateless link: the file is rebuilt on download, so it works on every Cloud Run instance and never expires
-        "url": f"{_public_base(request)}/dxf/{b.name}?q={token}",
+        "url": f"{_public_base(request)}/{req.formaat}/{b.name}?q={token}",
         "bestand": b.name,
+        "formaat": req.formaat,
         "bytes": size,
         "locatie": b.naam,
         "middelpunt": {"x": b.cx, "y": b.cy},
@@ -231,14 +292,22 @@ async def generate(req: GenerateRequest, request: Request):
     }
 
 
+MEDIA = {"dxf": "application/dxf", "dwg": "application/acad"}
+
+
 @app.get("/dxf/{name}")
-async def dxf(name: str, q: str, request: Request):
+@app.get("/dwg/{name}")
+async def download(name: str, q: str, request: Request):
     _check_rate(request.client.host if request.client else "?")
     req = _decode_req(q)
-    b = await _build(req)
-    data = await asyncio.to_thread(_dxf_bytes, b.doc)
-    return Response(content=data, media_type="application/dxf",
-                    headers={"Content-Disposition": f'attachment; filename="{b.name}"', "Cache-Control": "public, max-age=600"})
+    if q in _cache:
+        fname, data = _cache[q]
+    else:
+        b = await _build(req)
+        fname, data = b.name, await _file_bytes(b, req.formaat)
+        _cache_put(q, fname, data)
+    return Response(content=data, media_type=MEDIA[req.formaat],
+                    headers={"Content-Disposition": f'attachment; filename="{fname}"', "Cache-Control": "public, max-age=600"})
 
 
 @app.get("/files/{job_id}/{name}")
