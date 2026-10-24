@@ -145,12 +145,17 @@ async def fetch_all(collections: list[Collection], bbox: tuple[float, float, flo
 
         async def one(c: Collection) -> tuple[Collection, list[dict]]:
             async with sem:
-                if c.api == "brk":
-                    return c, await fetch_wfs(client, c.collection, bbox)
-                if known.get(c.api) and c.collection not in known[c.api]:
-                    warnings.append(f"Laag {c.collection} bestaat niet (meer) bij PDOK en is overgeslagen.")
+                if c.api != "brk" and known.get(c.api) and c.collection not in known[c.api]:
+                    log.info("skip %s/%s: not offered by PDOK", c.api, c.collection)
                     return c, []
-                return c, await fetch_ogc(client, c.api, c.collection, bbox)
+                try:
+                    if c.api == "brk":
+                        return c, await fetch_wfs(client, c.collection, bbox)
+                    return c, await fetch_ogc(client, c.api, c.collection, bbox)
+                except Exception as exc:  # one failing layer must not kill the whole job
+                    log.warning("fetch %s/%s failed: %s", c.api, c.collection, exc)
+                    warnings.append(f"Laag {c.dxf_layer} kon niet worden opgehaald bij PDOK en ontbreekt in dit bestand.")
+                    return c, []
 
         results = await asyncio.gather(*(one(c) for c in collections))
     return dict(results)

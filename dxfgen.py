@@ -165,8 +165,9 @@ def _label_text(props: dict, attr: str) -> str | None:
     # BAG: huisnummer + huisletter + toevoeging
     if attr == "huisnummer":
         text += str(props.get("huisletter") or "")
-        if props.get("huisnummertoevoeging"):
-            text += f"-{props['huisnummertoevoeging']}"
+        toev = props.get("toevoeging") or props.get("huisnummertoevoeging")
+        if toev:
+            text += f"-{toev}"
     return text
 
 

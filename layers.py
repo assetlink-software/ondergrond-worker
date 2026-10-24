@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 PDOK_BGT = "https://api.pdok.nl/lv/bgt/ogc/v1"
-PDOK_BAG = "https://api.pdok.nl/lv/bag/ogc/v1"
+PDOK_BAG = "https://api.pdok.nl/kadaster/bag/ogc/v2"
 PDOK_BRT = "https://api.pdok.nl/brt/top10nl/ogc/v1"
 PDOK_BRK_WFS = "https://service.pdok.nl/kadaster/kadastralekaart/wfs/v5_0"
 PDOK_LOCATIESERVER = "https://api.pdok.nl/bzk/locatieserver/search/v3_1"
