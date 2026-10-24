@@ -9,7 +9,7 @@ POST /generate
   }
   → { "job_id", "url", "bestand", "objecten", "lagen": {...}, "waarschuwingen": [...], "duur_ms" }
 
-GET /files/{job_id}/{name}   → the DXF (files are deleted after FILE_TTL_HOURS)
+GET /dxf/{name}?q=<token>    → the DXF, rebuilt on request (stateless, works on any instance)
 GET /geocode?q=...           → Locatieserver proxy
 GET /health
 """
@@ -17,6 +17,10 @@ GET /health
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
+import json
+import zlib
 import logging
 import os
 import time
@@ -25,7 +29,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from dxfgen import Options, build_dxf, circle_area, polygon_area
@@ -107,14 +111,14 @@ async def geocode(q: str):
     return {"id": r.id, "naam": r.naam, "type": r.type, "x": r.x, "y": r.y}
 
 
-@app.post("/generate")
-async def generate(req: GenerateRequest, request: Request):
-    t0 = time.perf_counter()
-    _check_rate(request.client.host if request.client else "?")
-    _cleanup_old_files()
-    warnings: list[str] = []
+class _Built:
+    def __init__(self, doc, result, area, cx, cy, naam, name):
+        self.doc, self.result, self.area, self.cx, self.cy, self.naam, self.name = doc, result, area, cx, cy, naam, name
 
-    # 1. centre
+
+async def _build(req: GenerateRequest) -> _Built:
+    """Geocode → area → layer groups → fetch PDOK → clip + write. Stateless: nothing is stored."""
+    warnings: list[str] = []
     if req.adres:
         try:
             g = await geocode_simple(req.adres)
@@ -126,7 +130,6 @@ async def generate(req: GenerateRequest, request: Request):
     else:
         raise HTTPException(400, "Geef een adres of een x/y-coördinaat (RD) op.")
 
-    # 2. area
     if req.polygon and len(req.polygon) >= 3:
         area = polygon_area(req.polygon)
     else:
@@ -137,7 +140,6 @@ async def generate(req: GenerateRequest, request: Request):
     if area.area_km2 > MAX_AREA_KM2:
         raise HTTPException(400, f"Gebied maximaal {MAX_AREA_KM2:g} km² (nu {area.area_km2:.2f} km²).")
 
-    # 3. layer groups (BGT → BRT when too large)
     groups = []
     for gid in req.lagen:
         grp = LAYER_GROUPS.get(gid)
@@ -155,7 +157,6 @@ async def generate(req: GenerateRequest, request: Request):
     if not collections:
         raise HTTPException(400, "Kies minstens één laag.")
 
-    # 4. fetch + 5. clip/write
     try:
         feats = await fetch_all(collections, area.bbox, warnings)
     except PdokError as exc:
@@ -163,46 +164,89 @@ async def generate(req: GenerateRequest, request: Request):
     opt = Options(text_height=req.opties.text_height, include_frame=req.opties.include_frame,
                   clip_mode=req.opties.clip_mode, hatch=req.opties.hatch)
     doc, result = await asyncio.to_thread(build_dxf, feats, area, opt, warnings)
-
-    # 6. save
-    job_id = uuid.uuid4().hex[:12]
-    job_dir = FILES_DIR / job_id
-    job_dir.mkdir(parents=True, exist_ok=True)
     rad = f"{area.radius_m:g}m" if area.radius_m else "polygoon"
     name = f"ondergrond_{int(cx)}_{int(cy)}_{rad}.dxf"
-    path = job_dir / name
-    await asyncio.to_thread(doc.saveas, path)
-    size = path.stat().st_size
-    duur = int((time.perf_counter() - t0) * 1000)
-    log.info("job %s: %s objects, %d layers, %d bytes, %d ms", job_id, result.objects, len(result.counts), size, duur)
+    return _Built(doc, result, area, cx, cy, naam, name)
+
+
+def _dxf_bytes(doc) -> bytes:
+    buf = io.StringIO()
+    doc.write(buf)
+    return buf.getvalue().encode("utf-8")
+
+
+def _encode_req(req: GenerateRequest, cx: float, cy: float) -> str:
+    """Compact, URL-safe token that holds the whole request (address already resolved to x/y)."""
+    data = {
+        "x": round(cx, 2), "y": round(cy, 2),
+        "r": req.straal_m,
+        "p": [[round(a, 2), round(b, 2)] for a, b in req.polygon] if req.polygon else None,
+        "l": req.lagen,
+        "o": req.opties.model_dump(),
+    }
+    raw = zlib.compress(json.dumps(data, separators=(",", ":")).encode(), 9)
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _decode_req(token: str) -> GenerateRequest:
+    try:
+        raw = zlib.decompress(base64.urlsafe_b64decode(token + "=" * (-len(token) % 4)))
+        d = json.loads(raw)
+        return GenerateRequest(x=d["x"], y=d["y"], straal_m=d.get("r"), polygon=d.get("p"),
+                               lagen=d["l"], opties=Opties(**d.get("o", {})))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(400, "Ongeldige downloadlink.") from exc
+
+
+def _public_base(request: Request) -> str:
     base = PUBLIC_BASE or str(request.base_url).rstrip("/")
     if base.startswith("http://") and not any(h in base for h in ("localhost", "127.0.0.1")):
         base = "https://" + base[len("http://"):]   # Cloud Run terminates TLS in front of us
+    return base
+
+
+@app.post("/generate")
+async def generate(req: GenerateRequest, request: Request):
+    t0 = time.perf_counter()
+    _check_rate(request.client.host if request.client else "?")
+    b = await _build(req)
+    size = len(await asyncio.to_thread(_dxf_bytes, b.doc))
+    duur = int((time.perf_counter() - t0) * 1000)
+    token = _encode_req(req, b.cx, b.cy)
+    log.info("generate %s: %s objects, %d layers, %d bytes, %d ms", b.name, b.result.objects, len(b.result.counts), size, duur)
     return {
-        "job_id": job_id,
-        "url": f"{base}/files/{job_id}/{name}",
-        "bestand": name,
+        "job_id": token[:12],
+        # stateless link: the file is rebuilt on download, so it works on every Cloud Run instance and never expires
+        "url": f"{_public_base(request)}/dxf/{b.name}?q={token}",
+        "bestand": b.name,
         "bytes": size,
-        "locatie": naam,
-        "middelpunt": {"x": cx, "y": cy},
-        "gebied": area.label,
-        "km2": round(area.area_km2, 4),
-        "objecten": result.objects,
-        "lagen": dict(result.counts.most_common()),
-        "waarschuwingen": result.warnings,
+        "locatie": b.naam,
+        "middelpunt": {"x": b.cx, "y": b.cy},
+        "gebied": b.area.label,
+        "km2": round(b.area.area_km2, 4),
+        "objecten": b.result.objects,
+        "lagen": dict(b.result.counts.most_common()),
+        "waarschuwingen": b.result.warnings,
         "duur_ms": duur,
     }
 
 
+@app.get("/dxf/{name}")
+async def dxf(name: str, q: str, request: Request):
+    _check_rate(request.client.host if request.client else "?")
+    req = _decode_req(q)
+    b = await _build(req)
+    data = await asyncio.to_thread(_dxf_bytes, b.doc)
+    return Response(content=data, media_type="application/dxf",
+                    headers={"Content-Disposition": f'attachment; filename="{b.name}"', "Cache-Control": "public, max-age=600"})
+
+
 @app.get("/files/{job_id}/{name}")
-async def files(job_id: str, name: str):
-    path = FILES_DIR / job_id / name
-    if not path.is_file() or ".." in job_id or ".." in name:
-        raise HTTPException(404, "Bestand niet (meer) beschikbaar.")
-    return FileResponse(path, media_type="application/dxf", filename=name)
+async def files_legacy(job_id: str, name: str):
+    raise HTTPException(410, "Deze downloadlink is verlopen. Genereer het bestand opnieuw.")
 
 
 @app.exception_handler(Exception)
 async def unhandled(request: Request, exc: Exception):
     log.exception("unhandled error")
-    return JSONResponse(500, {"detail": "Er ging iets mis bij het genereren.", "technisch": f"{type(exc).__name__}: {exc}"})
+    return JSONResponse(status_code=500, content={"detail": "Er ging iets mis bij het genereren.", "technisch": f"{type(exc).__name__}: {exc}"})
