@@ -27,6 +27,12 @@ class PdokError(RuntimeError):
     pass
 
 
+def _is_current(feature: dict) -> bool:
+    """BGT/BAG OGC APIs also return superseded versions; keep only the current one."""
+    p = feature.get("properties") or {}
+    return not (p.get("eind_registratie") or p.get("termination_date") or p.get("eindGeldigheid"))
+
+
 @dataclass
 class GeocodeResult:
     id: str
@@ -89,7 +95,7 @@ async def fetch_ogc(client: httpx.AsyncClient, api: str, collection: str,
         if r.status_code != 200:
             raise PdokError(f"PDOK {api}/{collection} gaf {r.status_code}: {r.text[:200]}")
         data = r.json()
-        features.extend(data.get("features", []))
+        features.extend(f for f in data.get("features", []) if _is_current(f))
         pages += 1
         next_url = None
         next_params = None  # `next` links carry their own query string

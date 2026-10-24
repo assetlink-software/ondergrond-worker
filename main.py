@@ -176,6 +176,8 @@ async def generate(req: GenerateRequest, request: Request):
     duur = int((time.perf_counter() - t0) * 1000)
     log.info("job %s: %s objects, %d layers, %d bytes, %d ms", job_id, result.objects, len(result.counts), size, duur)
     base = PUBLIC_BASE or str(request.base_url).rstrip("/")
+    if base.startswith("http://") and not any(h in base for h in ("localhost", "127.0.0.1")):
+        base = "https://" + base[len("http://"):]   # Cloud Run terminates TLS in front of us
     return {
         "job_id": job_id,
         "url": f"{base}/files/{job_id}/{name}",
